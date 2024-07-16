@@ -1,0 +1,179 @@
+---
+title: "Monte Carlo Simulation - Bayesian"
+author: "Nikhil Kamath"
+date: "2024-07-09"
+output: html_document
+---
+
+
+Bayesian Probability - Monte Carlo Simulation on Automotive Data
+
+In this project, we will be using R code in order to do an exploratory data analysis of automotive data using the foundations of Bayesian Probability to produce accurate and concise results.
+
+Questions and Objectives
+
+1.)Use Monte Carlo approximation to estimate the marginal probability of a compact car (manufacture == ‘honda’).
+
+2.) Use Gibbs sampling of Binomial-Beta conjugate prior-posterior to estimate the marginal probability of a ‘honda’ car.
+
+3.)Use Naive Bayes to estimate the conditional probability of a ‘honda’ car given the MPGs of city (cty) and highway (hwy).
+
+4.)Besides the city and highway MPGs, what else features are useful to predict a car manufacture?
+
+#Loading in Libraries
+
+```{r setup, include=FALSE}
+install.packages("ggplot2")
+install.packages("dplyr")
+library(ggplot2)
+library(dplyr)
+
+data(mpg)
+head(mpg)
+```
+
+
+#Monte Carlo Simulation - Honda
+
+
+Next, we are going to simulate a monte carlo simulation using R code foor the mpg data
+```{r}
+# Monte Carlo approximation to estimate the marginal probability of a Honda car
+set.seed(123)  # For reproducibility
+n_samples <- 10000
+samples <- sample(mpg$manufacturer, n_samples, replace = TRUE)
+honda_count <- sum(samples == 'honda')
+honda_prob <- honda_count / n_samples
+
+print(honda_prob)
+```
+
+Based on this simulation, the probability above shows the probability that a car is drawn is a Honda is 0.0336.
+
+
+#Gibbs Sampling for Binomial-Beta Conjugate Prior-Posterior
+
+Next we will be conducting a Gibbs sampling with the given code:
+
+```{r}
+# Function for Gibbs sampling of Binomial-Beta
+gibbs_sampler <- function(n_iter, a, b, data) {
+  # Initialize storage for samples
+  samples <- numeric(n_iter)
+
+  # Initial value for theta
+  theta <- rbeta(1, a, b)
+
+  for (i in 1:n_iter) {
+    # Sample from Beta posterior
+    theta <- rbeta(1, a + sum(data), b + length(data) - sum(data))
+    samples[i] <- theta
+  }
+
+  return(samples)
+}
+
+# Filter data for Honda cars
+honda_data <- mpg %>% filter(manufacturer == 'honda')
+n_honda <- nrow(honda_data)
+
+# Assume prior parameters a and b
+a <- 1
+b <- 1
+
+# Run Gibbs sampler
+n_iter <- 10000
+samples <- gibbs_sampler(n_iter, a, b, rep(1, n_honda))
+
+# Posterior mean estimate
+posterior_mean <- mean(samples)
+print(posterior_mean)
+
+```
+
+The result of the gibbs value is around 0.91, which is the best estimate of the joint distribution of variables.
+
+
+Naive Bayes to Estimate Conditional Probability of a ‘Honda’ Car Given MPGs of City (cty) and Highway (hwy)
+
+```{r}
+# Load necessary libraries
+install.packages("e1071")
+library(e1071)
+
+# Prepare data
+mpg$manufacturer <- as.factor(mpg$manufacturer)
+
+# Fit Naive Bayes model
+model <- naiveBayes(manufacturer ~ cty + hwy, data = mpg)
+
+# Predict the probability of a car being a Honda
+pred <- predict(model, mpg, type = "raw")
+
+# Print the first few probabilities for Honda
+print(head(pred[, "honda"]))
+
+```
+The values provided appear to be the conditional probabilities estimated by the Naive Bayes model for a 'Honda' car given different combinations of city (cty) and highway (hwy) miles per gallon (MPG) features. Here’s how we can interpret these values:
+
+First value: 3.744117e-04: This represents a very small probability, indicating that given the specific combination of cty and hwy MPG values in this instance, the likelihood of the car being a Honda is quite low.
+
+Second value: 3.708975e-02: This represents a probability of approximately 0.037, suggesting a higher likelihood compared to the first value, but still relatively low.
+
+Third value: 3.713792e-02: This is similar to the second value, indicating a slightly higher probability for a different combination of cty and hwy MPG values.
+
+Fourth value: 7.210436e-02: This value is approximately 0.072, indicating a higher probability compared to the previous ones, suggesting a greater likelihood of the car being a Honda given the particular cty and hwy MPG values.
+
+Fifth value: 5.428574e-07: This represents an extremely small probability, almost negligible, indicating that for this combination of cty and hwy MPG values, the likelihood of the car being a Honda is extremely low.
+
+Sixth value: 1.518399e-05: This is also a very small probability, indicating a very low likelihood of the car being a Honda for the given combination of cty and hwy MPG values.
+
+
+#Feature Engineering - Prediction
+
+
+There are two ways to go about the feature conditional probability, the first is a machine learning algorithm known as a random forest classifier, but seeing as we are statisticians, we must use an ANOVA table in order to deterimine the most prominent and predicitive features
+
+
+```{r}
+# Load necessary libraries
+install.packages("randomForest")
+library(randomForest)
+
+# Fit Random Forest model
+rf_model <- randomForest(manufacturer ~ ., data = mpg, importance = TRUE)
+
+# Get feature importance
+importance <- importance(rf_model)
+
+# Print feature importance
+print(importance)
+```
+# ANOVA variance section
+
+```{r}
+# Load necessary libraries
+library(ggplot2)
+library(dplyr)
+
+# Load the mpg dataset
+data(mpg)
+
+# Function to perform ANOVA
+anova_test <- function(feature) {
+  model <- aov(mpg[[feature]] ~ mpg$manufacturer)
+  anova_result <- summary(model)
+  return(anova_result[[1]]$`Pr(>F)`[1])
+}
+
+# Select numerical features
+numerical_features <- mpg %>% select_if(is.numeric) %>% names()
+
+# Apply ANOVA to each numerical feature
+anova_p_values <- sapply(numerical_features, anova_test)
+
+# Print ANOVA p-values
+print(anova_p_values)
+
+```
+Based on the ANOVA values, we can see that the features that predict mpg are displacement, the year, cylinder, city, and highways of the given honda at hand. This also corresponds to the random forest classifer that was run in the Honda section. Cross refrencing these values, we can see that these are the biggest indicators of MPG.
