@@ -1,0 +1,715 @@
+---
+title: "BayesianProbability-BostonHousing"
+output: html_document
+author: "Nikhil Kamath"
+date: "2024-07-31"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction and Background
+
+### Bayesian Ridge Regression
+
+**Bayesian Ridge Regression** is a Bayesian approach to linear regression that incorporates prior distributions on the regression coefficients and the variance of the error term. The model assumes that the regression coefficients follow a Gaussian prior with zero mean and a fixed variance. This approach regularizes the regression by shrinking the coefficients towards zero, which helps to mitigate overfitting. The Bayesian Ridge model estimates both the regression coefficients and their uncertainty, providing a probabilistic interpretation of the predictions.
+
+Key aspects:
+- **Prior Distribution**: Coefficients are assumed to follow a Gaussian distribution with zero mean.
+- **Hyperparameters**: Include the variance of the prior distribution and the variance of the noise.
+- **Inference**: Uses Bayesian inference to update beliefs about the coefficients based on observed data.
+
+### Bayesian Lasso
+
+**Bayesian Lasso** extends the concept of Lasso (Least Absolute Shrinkage and Selection Operator) regression by adopting a Bayesian framework. Unlike the Ridge regression which uses a Gaussian prior, the Bayesian Lasso applies a Laplace prior (also known as a double-exponential prior) on the coefficients. This prior encourages sparsity, meaning that it can shrink some coefficients to exactly zero, effectively performing feature selection.
+
+Key aspects:
+- **Prior Distribution**: Coefficients are assumed to follow a Laplace distribution, promoting sparsity.
+- **Hyperparameters**: Include the scale parameter of the Laplace distribution and the variance of the noise.
+- **Inference**: Bayesian Lasso provides a probabilistic approach to feature selection and coefficient estimation.
+
+### Bayesian Stochastic Search Variable Selection (SSVS)
+
+**Bayesian Stochastic Search Variable Selection (SSVS)** is a Bayesian approach to variable selection that combines a stochastic search algorithm with Bayesian inference. In SSVS, each variable is assigned a binary inclusion indicator that determines whether it is included in the model or not. The model then uses a stochastic search process to explore different subsets of variables and estimate the posterior probabilities of these variables being included.
+
+Key aspects:
+- **Prior Distribution**: Uses a mixture of normal distributions to allow for both inclusion and exclusion of variables.
+- **Binary Inclusion Indicators**: Each predictor is associated with a binary variable indicating its inclusion.
+- **Inference**: Involves a Markov Chain Monte Carlo (MCMC) process to sample from the posterior distribution and estimate the inclusion probabilities.
+
+### Overview of the Boston Housing Dataset
+
+The **Boston Housing Dataset** is a well-known dataset used for evaluating regression models. It contains information about housing values in suburbs of Boston and is often used to study and practice various statistical and machine learning techniques. The dataset includes the following features:
+
+- **crim**: Per capita crime rate by town.
+- **zn**: Proportion of residential land zoned for lots over 25,000 sq. ft.
+- **indus**: Proportion of non-retail business acres per town.
+- **chas**: Charles River dummy variable (1 if tract bounds river; 0 otherwise).
+- **nox**: Nitric oxides concentration (parts per 10 million).
+- **rm**: Average number of rooms per dwelling.
+- **age**: Proportion of owner-occupied units built prior to 1940.
+- **dis**: Weighted distances to five Boston employment centers.
+- **rad**: Index of accessibility to radial highways.
+- **tax**: Full-value property tax rate per $10,000.
+- **ptratio**: Pupil-teacher ratio by town.
+- **b**: \(1000(Bk - 0.63)^2\) where Bk is the proportion of Black residents by town.
+- **lstat**: Percentage of lower status of the population.
+- **medv**: Median value of owner-occupied homes in $1000s (target variable).
+
+Each row in the dataset represents a different suburb of Boston, and the goal is often to predict the `medv` (median value of homes) based on the other features. This dataset provides a rich context for exploring and comparing different regression models, especially those that incorporate Bayesian methods.
+
+
+
+### Loading Libraries
+
+```{r}
+
+install.packages("loo")
+library(loo)
+
+install.packages("dplyr")
+library(dplyr)
+
+install.packages("MASS")
+library(MASS)
+
+install.packages("caret")
+library(caret)
+
+install.packages("ggplot2")
+library(ggplot2)
+
+install.packages("reshape2")
+library(reshape2)
+
+install.packages("mvtnorm")
+library(mvtnorm)
+
+install.packages("loo")
+library(loo)
+
+install.packages("caret")
+library(caret)  # For createFolds
+```
+
+
+### Simple Data Analysis
+
+```{r}
+data(Boston)
+
+head(Boston)
+
+summary(Boston)
+```
+
+### Data Preprocessing...
+
+
+```{r}
+# Preprocess data to keep only numerical columns
+boston_numeric <- Boston %>% select_if(is.numeric)
+
+# Check for high correlations and remove highly correlated predictors
+corr_matrix <- cor(boston_numeric)
+high_corr <- findCorrelation(corr_matrix, cutoff = 0.5)
+boston_reduced <- boston_numeric[, -high_corr]
+
+# Ensure medv (median value of owner-occupied homes) is included
+boston_reduced$medv <- Boston$medv
+y_boston <- boston_reduced$medv
+X_boston <- model.matrix(medv ~ . - 1, data = boston_reduced)
+
+# Get the number of observations and predictors
+n <- length(y_boston)
+p <- ncol(X_boston)
+```
+
+
+### Correlation Heatmap
+
+
+```{r}
+# Melt correlation matrix for ggplot2
+melted_corr <- melt(corr_matrix)
+
+# Plot heatmap
+ggplot(data = melted_corr, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile() +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0, limit = c(-1, 1), space = "Lab", name="Pearson\nCorrelation") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, size = 10, hjust = 1)) +
+  coord_fixed()
+```
+### Splitting the boston housing data into training and test split using a 70-30 test class:
+
+
+```{r}
+
+X<- X_boston
+Y<- y_boston
+
+training_split <- sample(1:nrow(X), size = 0.7 * nrow(X))
+X_train <- X[training_split, ]
+Y_train <- Y[training_split]
+X_Test <- X[-training_split, ]
+Y_Test <- Y[-training_split]
+
+n <- length(Y_train)
+p <- ncol(X_train)
+```
+
+
+## Bayesian Ridge Regression
+
+### Bayesian Ridge Regression is a method that incorporates prior distributions on both regression coefficients and the error variance. By assuming that the coefficients follow a Gaussian prior with zero mean and a fixed variance, this approach regularizes the model by shrinking coefficients towards zero, thus reducing overfitting. The model estimates both the coefficients and their uncertainty, offering a probabilistic view of the predictions.
+
+
+```{r}
+bayesian_ridge <- function(X, y, n_iter = 1000, sigma2 = 1, tau2 = 2) {
+  XtX <- t(X) %*% X
+  Xty <- t(X) %*% y
+  beta_samples <- matrix(0, ncol = ncol(X), nrow = n_iter)
+  
+  for (i in 1:n_iter) {
+    Sigma_inv <- XtX + diag(ncol(X)) / tau2
+    Sigma <- solve(Sigma_inv)
+    mu <- Sigma %*% Xty / sigma2
+    beta_samples[i, ] <- rmvnorm(1, mean = mu, sigma = Sigma)
+  }
+  
+  colnames(beta_samples) <- colnames(X)
+  return(beta_samples)
+}
+```
+
+## Bayesian Lasso
+
+### Bayesian Lasso is a regularization technique that applies a Laplace prior to the regression coefficients. This method encourages sparsity in the model by shrinking some coefficients exactly to zero, effectively performing variable selection. By incorporating a probabilistic approach, Bayesian Lasso estimates both the coefficients and their uncertainty, providing a robust framework for handling high-dimensional data.
+
+
+```{r}
+bayesian_lasso <- function(X, y, n_iter = 1000, sigma2 = 1, lambda = 1, epsilon = 1e-6) {
+  p <- ncol(X)
+  XtX <- t(X) %*% X
+  Xty <- t(X) %*% y
+  beta_samples <- matrix(0, ncol = p, nrow = n_iter)
+  tau_samples <- matrix(0, ncol = p, nrow = n_iter)
+  tau2 <- rep(1, p)
+  
+  for (i in 1:n_iter) {
+    # Sample betas
+    Sigma_inv <- XtX + diag(1 / tau2 + epsilon)
+    Sigma <- solve(Sigma_inv)
+    mu <- Sigma %*% Xty / sigma2
+    beta_samples[i, ] <- rmvnorm(1, mean = mu, sigma = Sigma)
+    
+    # Sample tau2
+    for (j in 1:p) {
+      beta_j <- beta_samples[i, j]
+      tau_samples[i, j] <- 1 / rgamma(1, shape = 1, rate = abs(beta_j) / lambda)
+    }
+    tau2 <- tau_samples[i, ]
+  }
+  
+  colnames(beta_samples) <- colnames(X)
+  return(beta_samples)
+}
+```
+
+### Finding the best lambda value in the Bayesian Lasso regression...
+
+```{r}
+find_best_lambda_lasso <- function(X, y) {
+  lambdas <- seq(0.1, 2, by = 0.1)
+  
+  rmse_ridge <- sapply(lambdas, function(lambda) {
+    samples <- bayesian_lasso(X, y, lambda = lambda)
+    beta <- colMeans(samples)
+    sqrt(mean((y - X %*% beta)^2))
+  })
+  
+  best_lambda_ridge <- lambdas[which.min(rmse_ridge)]
+  return(best_lambda_ridge)
+}
+
+find_best_lambda_ridge <- function(X, y) {
+  lambdas <- seq(0.1, 2, by = 0.1)
+  
+  rmse_ridge <- sapply(lambdas, function(lambda) {
+    samples <- bayesian_ridge(X, y, tau2 = lambda)
+    beta <- colMeans(samples)
+    sqrt(mean((y - X %*% beta)^2))
+  })
+  
+  best_lambda_ridge <- lambdas[which.min(rmse_ridge)]
+  return(best_lambda_ridge)
+}
+```
+
+### Finding the best lambda value using the Bayesian Ridge Regression...
+
+
+```{r}
+best_lambda_ridge <- find_best_lambda_ridge(X, Y)
+print(best_lambda_ridge)
+best_lambda_lasso <- find_best_lambda_lasso(X,Y)
+print(best_lambda_lasso)
+```
+
+### Applying the best lambda values to the equation at hand....
+
+```{r}
+# Fit Bayesian Lasso model using the best lambda
+
+# Function to calculate DIC
+calculate_dic <- function(log_posterior, pD) {
+  deviance <- -2 * log_posterior
+  dic <- deviance + 2 * pD
+  return(dic)
+}
+
+# Function to calculate WAIC
+calculate_waic_manual <- function(log_likelihoods) {
+  lppd <- sum(log(colMeans(exp(log_likelihoods))))
+  p_waic <- sum(apply(log_likelihoods, 2, var))
+  waic <- -2 * (lppd - p_waic)
+  return(list(waic = waic, lppd = lppd, p_waic = p_waic))
+}
+
+lasso_samples <- bayesian_lasso(X, Y, lambda = best_lambda_lasso)
+beta_lasso <- colMeans(lasso_samples)
+lasso_cred_int <- apply(lasso_samples, 2, quantile, probs = c(0.025, 0.975))
+print(beta_lasso)
+
+# Fit Bayesian Ridge model using the best lambda
+ridge_samples <- bayesian_ridge(X, Y, tau2 = best_lambda_ridge)
+beta_ridge <- colMeans(ridge_samples)
+ridge_cred_int <- apply(ridge_samples, 2, quantile, probs = c(0.025, 0.975))
+print(beta_ridge)
+```
+### Printing lasso and ridge cred. int
+
+```{r}
+print(lasso_cred_int)
+print(ridge_cred_int)
+```
+
+### Stochastic Search Variable function
+
+### Bayesian Stochastic Search Variable Selection (SSVS) is a Bayesian method for selecting variables that integrates a stochastic search with Bayesian inference. It employs binary inclusion indicators for each variable and uses a stochastic search process to explore variable subsets, estimating posterior inclusion probabilities through a Markov Chain Monte Carlo (MCMC) process. Key features include a mixture of normal distributions for prior specification and MCMC for inference.
+
+```{r}
+ssvs_continuous <- function(data, y, x, inprob = 0.9, runs = 10000, burn = 2000, a1 = 1, b1 = 1, prec.beta = 1e-6, progress = FALSE) {
+  y <- data[[y]]
+  x <- as.matrix(data[x])
+  
+  # Error message for missing values
+  if (sum(is.na(x)) + sum(is.na(y)) > 0) {
+    stop("Missing values in selection")
+  }
+  
+  # Added scaling inside function for X only
+  x <- scale(x)
+  
+  p <- ncol(x)
+  xp <- matrix(0, 25, p)
+  xp[, 1] <- seq(-3, 3, length = 25)
+  n <- length(y)
+  np <- nrow(xp)
+  
+  # Initial values:
+  int <- mean(y)
+  beta <- rep(0, p)
+  alpha <- rep(0, p)
+  delta <- rep(0, p)
+  taue <- 1 / var(y)
+  
+  # Keep track of stuff:
+  keep.beta <- matrix(0, runs, p)
+  colnames(keep.beta) <- colnames(x)
+  keep.int <- keep.taue <- rep(0, runs)
+  keep.yp <- matrix(0, runs, np)
+  
+  # LET'S ROLL:
+  for (i in 1:runs) {
+    # Sample taue with check for numerical stability
+    taue <- rgamma(1, n / 2 + a1, rate = max(sum((y - int - x %*% beta)^2) / 2 + b1, 1e-10))
+    if (is.na(taue)) taue <- 1e-10  # If taue is NA, set to a small value
+    
+    # Sample int with check for numerical stability
+    int <- rnorm(1, mean(y - x %*% beta), sd = max(1 / sqrt(n * taue + 0.1), 1e-10))
+    
+    # Update alpha
+    z <- x %*% diag(delta)
+    V <- try(solve(taue * t(z) %*% z + prec.beta * diag(p)), silent = TRUE)
+    if (inherits(V, "try-error")) {
+      V <- diag(p) * 1e-6  # Add small value for numerical stability
+    }
+    M <- taue * t(z) %*% (y - int)
+    alpha <- V %*% M + t(chol(V)) %*% rnorm(p)
+    beta <- alpha *
+
+ delta
+    
+    # Update inclusion indicators:
+    r <- y - int - x %*% beta
+    for (j in 1:p) {
+      r <- r + x[, j] * beta[j]
+      log.p.in <- log(inprob) - 0.5 * taue * sum((r - x[, j] * alpha[j])^2)
+      log.p.out <- log(1 - inprob) - 0.5 * taue * sum(r^2)
+      diff <- log.p.in - log.p.out
+      diff <- ifelse(diff > 10, 10, diff)
+      p.in <- exp(diff) / (1 + exp(diff))
+      delta[j] <- rbinom(1, 1, p.in)
+      beta[j] <- delta[j] * alpha[j]
+      r <- r - x[, j] * beta[j]
+    }
+    
+    # Make predictions:
+    yp <- rnorm(np, int + xp %*% beta, 1 / sqrt(taue))
+    
+    # Store the output:
+    keep.beta[i, ] <- beta
+    keep.int[i] <- int
+    keep.taue[i] <- taue
+    keep.yp[i, ] <- yp
+    
+    if ((i %% 1000 == 0) & (progress == TRUE)) {
+      plot(beta, main = paste("Iteration", i))
+      abline(0, 0)
+    }
+  }
+  
+  result <- list(
+    beta = keep.beta[burn:runs, ],
+    int = keep.int[burn:runs],
+    taue = keep.taue[burn:runs],
+    pred = keep.yp[burn:runs, ]
+  )
+  
+  result
+}
+
+ssvs_results_boston <- ssvs_continuous(boston_reduced, y = "medv", x = colnames(X_boston), runs = 1000, burn = 500, a1 = 1, b1 = 1, prec.beta = 1e-6, progress = FALSE)
+ssvs_samples_boston <- ssvs_results_boston$beta
+ssvs_inclusion_prob_boston <- colMeans(ssvs_samples_boston != 0)
+beta_ssvs_boston <- colMeans(ssvs_samples_boston)
+print(beta_ssvs_boston)
+```
+```{r}
+print(ssvs_inclusion_prob_boston)
+```
+
+### Lets see the selcted variables for Ridge, Lasso, and SSVS...
+
+```{r}
+selected_variables_ridge_boston <- which(apply(ridge_cred_int, 2, function(x) sign(x[1]) == sign(x[2])))
+selected_variables_lasso_boston <- which(apply(lasso_cred_int, 2, function(x) sign(x[1]) == sign(x[2])))
+selected_variables_ssvs_boston <- which(ssvs_inclusion_prob_boston > 0.5)
+
+
+print(selected_variables_ridge_boston)
+print(selected_variables_lasso_boston)
+print(selected_variables_ssvs_boston)
+```
+### Next, lets plot the histograms and the traceplots of each graph....
+
+```{r}
+plot_histograms <- function(model_type, selected_variables, samples, X) {
+  # Check that the model_type is valid
+  if (!model_type %in% c("ridge", "lasso", "ssvs")) {
+    stop("Invalid model type. Choose 'ridge', 'lasso', or 'ssvs'.")
+  }
+  
+  # Check if there are selected variables to plot
+  if (length(selected_variables) > 0) {
+    par(mfrow = c(2, 2))
+    for (i in selected_variables) {
+      # Set appropriate title and sample data based on the model type
+      if (model_type == "ridge") {
+        hist(samples[, i], main = paste("Histogram of Beta (Bayesian Ridge)", colnames(X)[i]), xlab = colnames(X)[i], breaks = 100)
+      } else if (model_type == "lasso") {
+        hist(samples[, i], main = paste("Histogram of Beta (Bayesian Lasso)", colnames(X)[i]), xlab = colnames(X)[i], breaks = 100)
+      } else if (model_type == "ssvs") {
+        hist(samples[, i], main = paste("Histogram of Beta (SSVS)", colnames(X)[i]), xlab = colnames(X)[i], breaks = 100)
+      }
+    }
+    par(mfrow = c(1, 1)) # Reset to default layout
+  }
+}
+
+```
+
+
+```{r}
+
+# Example usage
+plot_histograms("ridge", selected_variables_ridge_boston, ridge_samples, X_boston)
+plot_histograms("lasso", selected_variables_lasso_boston, lasso_samples, X_boston)
+plot_histograms("ssvs", selected_variables_ssvs_boston, ssvs_samples_boston, X_boston)
+```
+```{r}
+traceplot_bayesian <- function(model_type, selected_variables, samples, X) {
+  # Check that the model_type is valid
+  if (!model_type %in% c("ridge", "lasso", "ssvs")) {
+    stop("Invalid model type. Choose 'ridge', 'lasso', or 'ssvs'.")
+  }
+  
+  # Check if there are selected variables to plot
+  if (length(selected_variables) > 0) {
+    par(mfrow = c(2, 2))
+    for (i in selected_variables) {
+      # Set appropriate title and sample data based on the model type
+      if (model_type == "ridge") {
+        plot(samples[, i], type = "l", main = paste("Trace Plot of Beta (Bayesian Ridge)", colnames(X)[i]), xlab = "Iteration", ylab = colnames(X)[i])
+      } else if (model_type == "lasso") {
+        plot(samples[, i], type = "l", main = paste("Trace Plot of Beta (Bayesian Lasso)", colnames(X)[i]), xlab = "Iteration", ylab = colnames(X)[i])
+      } else if (model_type == "ssvs") {
+        plot(samples[, i], type = "l", main = paste("Trace Plot of Beta (SSVS)", colnames(X)[i]), xlab = "Iteration", ylab = colnames(X)[i])
+      }
+    }
+    par(mfrow = c(1, 1)) # Reset to default layout
+  }
+}
+
+# Example usage
+traceplot_bayesian("ridge", selected_variables_ridge_boston, ridge_samples, X_boston)
+traceplot_bayesian("lasso", selected_variables_lasso_boston, lasso_samples, X_boston)
+traceplot_bayesian("ssvs", selected_variables_ssvs_boston, ssvs_samples_boston, X_boston)
+
+
+```
+
+### Next, we are computing the DIC and WAIC and using a log transformation to intepret their results...
+
+```{r}
+compute_dic_waic <- function(samples, X, y) {
+  log_lik <- function(beta, X, y) {
+    mu <- X %*% beta
+    dnorm(y, mu, sd = sd(y), log = TRUE)
+  }
+  
+  # Compute log-likelihood values
+  log_lik_values <- t(apply(samples, 1, function(beta) log_lik(beta, X, y)))
+  
+  # Compute DIC
+  log_lik_mean <- rowMeans(log_lik_values)
+  pD <- mean(apply(log_lik_values, 1, var))  # Variance of log-likelihood values across rows
+  DIC <- -2 * mean(log_lik_mean) + 2 * pD
+  
+  # Compute WAIC
+  waic_res <- loo::waic(log_lik_values)
+  
+  list(DIC = DIC, WAIC = waic_res)
+}
+
+dic_waic_ridge <- compute_dic_waic(ridge_samples, X, Y)
+dic_waic_lasso <- compute_dic_waic(lasso_samples, X, Y)
+dic_waic_ssvs <- compute_dic_waic(ssvs_samples_boston, X, Y)
+
+
+```
+
+```{r}
+dic_waic_ridge
+dic_waic_lasso
+dic_waic_ssvs
+```
+## WAIC and DIC Conclusions: 
+
+### Based on the provided metrics:
+
+### Bayesian Ridge appears to be the most reliable model, with both DIC and WAIC indicating good fit and relatively low values.
+
+
+### Bayesian Lasso shows signs of potential overfitting or model misfit, as indicated by the very high DIC and WAIC values.
+
+
+### SSVS lacks specific DIC and WAIC values, but should be considered potentially due to its complexity or other factors.
+
+
+### Overall, the Bayesian Ridge regression seems to be the most robust model based on DIC and WAIC values.
+
+```{r}
+# Bayes Factor computations using Savage-Dickey density ratio method
+compute_bayes_factor <- function(samples1, samples2) {
+  posterior1 <- density(samples1)
+  posterior2 <- density(samples2)
+  
+  prior1 <- dnorm(0, mean = mean(samples1), sd = sd(samples1))
+  prior2 <- dnorm(0, mean = mean(samples2), sd = sd(samples2))
+  
+  posterior_density_ratio <- approxfun(posterior1)(0) / approxfun(posterior2)(0)
+  prior_density_ratio <- prior1 / prior2
+  
+  bf <- posterior_density_ratio / prior_density_ratio
+  bf
+}
+
+bayes_factor_ridge_lasso <- compute_bayes_factor(ridge_samples, lasso_samples)
+bayes_factor_ridge_ssvs <- compute_bayes_factor(ridge_samples, ssvs_samples_boston)
+bayes_factor_lasso_ssvs <- compute_bayes_factor(lasso_samples, ssvs_samples_boston)
+
+bayes_factor_ridge_lasso
+bayes_factor_lasso_ssvs
+bayes_factor_ridge_ssvs
+```
+### The Bayes Factor values suggest that:
+
+### Bayesian Ridge and Bayesian Lasso: Both models are almost equivalent in terms of performance based on the Bayes Factor. There is no overwhelming strong evidence to prefer one over the other.
+
+### Bayesian Lasso and SSVS: The Bayesian SSVS model is slightly favored over lassoo, although the evidence is weak based on the given value.
+
+### Bayesian Ridge and SSVS: The Bayesian Ridge model is slightly favored over SSVS, although the evidence is weak based on the given value.
+
+### Computing 5-Fold Cross-Val RMSE values....
+
+```{r}
+
+compute_cv_rmse <- function(model_func, X, y, selected_vars, k = 5) {
+  folds <- createFolds(y, k = k, list = TRUE)
+  rmse <- sapply(folds, function(fold) {
+    X_train <- X[-fold, selected_vars, drop = FALSE]
+    y_train <- y[-fold]
+    X_test <- X[fold, selected_vars, drop = FALSE]
+    y_test <- y[fold]
+    
+    # Fit model and get posterior samples
+    beta_samples <- model_func(X_train, y_train)
+    beta <- colMeans(beta_samples)  # Mean of posterior samples as coefficients
+    
+    # Predict and compute RMSE
+    y_pred <- X_test %*% beta
+    sqrt(mean((y_test - y_pred)^2))
+  })
+  
+  return(mean(rmse))  # Mean RMSE over all folds
+}
+
+# Example usage (assuming bayesian_ridge, bayesian_lasso, ssvs_continuous are defined and cv_lasso is available)
+cv_rmse_ridge <- compute_cv_rmse(function(X, y) bayesian_ridge(X, y, tau2 = best_lambda_ridge), X_boston, y_boston, selected_variables_ridge_boston)
+cv_rmse_lasso <- compute_cv_rmse(function(X, y) bayesian_lasso(X, y, lambda = best_lambda_lasso), X_boston, y_boston, selected_variables_lasso_boston)
+cv_rmse_ssvs <- compute_cv_rmse(function(X, y) {
+  data <- data.frame(X, y = y)
+  ssvs_results <- ssvs_continuous(data, y = "y", x = colnames(X), runs = 1000, burn = 500)
+  ssvs_results$beta
+}, X_boston, y_boston, selected_variables_ssvs_boston)
+
+# Print Cross-Validation RMSEs
+cv_rmse_ridge
+cv_rmse_lasso
+cv_rmse_ssvs
+```
+
+
+### Based on the 5-Fold Cross Validation, Ridge and Lasso preform the best, with ridge preforming slightly better than lasso, while ssvs preforms poorly given the returned RMSE value.
+
+
+# Answers: 
+
+## 1.) Analysis of Bayesian Ridge, Bayesian Lasso, and Bayesian SSVS
+
+### Bayesian Ridge Regression
+
+### Bayesian Ridge Regression is a method that incorporates prior distributions on both regression coefficients and the error variance. By assuming that the coefficients follow a Gaussian prior with zero mean and a fixed variance, this approach regularizes the model by shrinking coefficients towards zero, thus reducing overfitting. The model estimates both the coefficients and their uncertainty, offering a probabilistic view of the predictions.
+
+## Bayesian Lasso Regression
+
+### Bayesian Lasso is a regularization technique that applies a Laplace prior to the regression coefficients. This method encourages sparsity in the model by shrinking some coefficients exactly to zero, effectively performing variable selection. By incorporating a probabilistic approach, Bayesian Lasso estimates both the coefficients and their uncertainty, providing a robust framework for handling high-dimensional data.
+
+
+## Bayesian SSVS
+
+### SSVS(Stochastic Search Variable Selection) is a Bayesian approach to variable selection that combines a stochastic search algorithm with Bayesian inference. In SSVS, each variable is assigned a binary inclusion indicator that determines whether it is included in the model or not. The model then uses a stochastic search process to explore different subsets of variables and estimate the posterior probabilities of these variables being included.
+
+
+### Overview of the Boston Housing Dataset
+
+The **Boston Housing dataset** is a well-known dataset in machine learning and statistics, often used for regression tasks. It provides information on housing values and associated features in various suburbs of Boston.
+
+### Features of the Boston Housing Dataset
+
+- **CRIM**: Per capita crime rate by town
+- **ZN**: Proportion of residential land zoned for lots over 25,000 sq. ft.
+- **INDUS**: Proportion of non-retail business acres per town
+- **CHAS**: Charles River dummy variable (1 if tract bounds river; 0 otherwise)
+- **NOX**: Nitric oxides concentration (parts per 10 million)
+- **RM**: Average number of rooms per dwelling
+- **AGE**: Proportion of owner-occupied units built prior to 1940
+- **DIS**: Weighted distances to five Boston employment centers
+- **RAD**: Index of accessibility to radial highways
+- **TAX**: Full-value property tax rate per $10,000
+- **PTRATIO**: Pupil-teacher ratio by town
+- **B**: \(1000(Bk - 0.63)^2\) where \(Bk\) is the proportion of Black residents by town
+- **LSTAT**: Percentage of lower status of the population
+- **MEDV**: Median value of owner-occupied homes in $1000s (target variable)
+
+These features are used to predict **MEDV**, the median value of homes, making this dataset ideal for exploring regression techniques and model performance.
+
+## 2.) Posterior Sampling Function and Model Assumptions
+
+### Posterior Sampling Function - For the posterior sampling function, we utilize a gibbs sampling method such as MCMC to approximate the posterior.
+
+### Model Assumptions
+
+#### Bayesian Lasso : In this model, we assume a Laplace (or a double exponential) Prior for the regression coefficent.
+
+#### Bayesian Ridge: In this model, we assume a Gaussian Prior for the regression coefficent
+
+#### Bayesian SSVS: In this model, we assume a Zellener's G Prior for the regression coefficent.
+
+## 3.) Hyperparameters
+
+### Bayesian Lasso Regression - For the Bayesian Lasso regression, we utilized the RMSE values to calculate the best lambda values, iterating by a scale of 0.1 from a range of 0-1, which turned out to be 1.9-2
+
+### Bayesiaian Ridge Regression - For the Bayesian Ridge Regression, we utilized the RMSE values to calculate the best lambda(tau) values , iterating by a scale of 0.1 from a range of 0-1, which turned out to be 0.1
+
+### Bayesian SSVS - For the Bayesian SSVS, we utilized the Spike and Slab method combine with increasing the inclusion probability in order to hypertune the parameters, excluding anything below 0.5
+
+## Trace Plots and the Variables Selected
+
+### Trace Plots - Each of the trace plots showed promising results, given that each converge while not showing much signs of deviation for all 3 Bayesian methods, with the exception of SSVS chas variable, not converging much.
+
+### Variables Selected - 
+### Bayesian Lasso -   crim      zn    chas      rm ptratio   black 
+### Bayesian Ridge -   crim      zn    chas      rm ptratio   black 
+### SSVS - crim chas   rm 
+
+
+## 4.) Comparing Measures of Fit: 
+
+## Model Evaluation Metrics
+
+### DIC (Deviance Information Criterion)
+
+### The Deviance Information Criterion (DIC) balances goodness-of-fit and model complexity by penalizing models with more parameters to avoid over fitting. The lowest values indicate a higher prefrence for model interpretation.
+
+### In terms of this metric, we can see that the DIC values preformed best for the Ridge, Lasso, and SSVS respectively. We can also see a drastic increase in the SSVS values  provided, given that model's complexity significantly contributes to the deviance, leading to a higher penalty for overfitting compared to Ridge and Lasso.
+
+
+### WAIC (Widely Applicable Information Criterion)
+
+### The Widely Applicable Information Criterion (WAIC) estimates predictive accuracy by incorporating both model fit and complexity, with a penalty term to account for overfitting.Lower values is also preferred in this model.
+
+
+### The WAIC for both Ridge and Lasso models perform at the same value, while the SSVS performs massively higher, indicating a significantly worse fit or greater model complexity. 
+
+### Bayes Factor
+
+### The Bayes Factor compares the evidence for two competing models by calculating the ratio of their marginal likelihoods, indicating how much more likely the data is under one model compared to the other.
+
+### The Bayes Factor of 1.006312 indicates nearly equivalent support for the Ridge and Lasso models, while the Bayes Factors of 0.3006682 and 0.302566 show a strong preference for the Lasso and Ridge models, respectively, over the SSVS model. This suggests that both Ridge and Lasso models are favored compared to SSVS, with Lasso slightly more preferred than Ridge.
+
+### 5-Fold Cross-Val RMSE (Root Mean Squared Error)
+
+### The 5-Fold Cross-Val RMSE assesses model performance by splitting the data into five subsets, training on four, testing on the remaining one, and averaging the RMSE over these folds to evaluate predictive accuracy.
+
+### The 5-Fold Cross-Val RMSE shows that Ridge regression achieves the lowest error (5.649161), followed closely by Lasso regression (5.704806), while SSVS has a significantly higher error (19.62582). This indicates that Ridge and Lasso models perform better in terms of prediction accuracy compared to SSVS, with Ridge slightly outperforming Lasso.
+
+### Overall Conclusion:
+
+### Overall Conclusion:
+
+### The evaluation metrics reveal that Ridge and Lasso regression models generally outperform Bayesian Stochastic Search Variable Selection (SSVS). Both DIC and WAIC indicate that Ridge and Lasso models have better fit and less complexity compared to SSVS, with SSVS showing a significantly higher DIC and WAIC due to its greater complexity. The Bayes Factor analysis further supports this, showing nearly equal support for Ridge and Lasso models, but a strong preference for these over SSVS. Additionally, the 5-Fold Cross-Val RMSE confirms that Ridge and Lasso models achieve lower prediction errors, with Ridge performing slightly better. Overall, Ridge and Lasso models are preferred for their balance of fit, complexity, and predictive accuracy, while SSVS is less favorable due to its higher complexity and poorer performance.
