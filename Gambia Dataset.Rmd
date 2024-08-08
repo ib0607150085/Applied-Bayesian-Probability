@@ -1,0 +1,808 @@
+---
+title: "Gambia Dataset - Baysian Perespective"
+author: "Nikhil Kamath"
+output: html_document
+date: "2024-07-27"
+---
+
+
+# Load Required Libraries
+
+First, let us load the required libraries needed into the .RMD file
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(geoR)
+library(ggplot2)
+library(dplyr)
+library(MASS)
+library(mvtnorm)
+library(caret)
+library(BoomSpikeSlab)
+library(pROC)
+library(loo)
+library(knitr)
+```
+
+# Load and Prepare Data
+
+Next, lets load and prepare the gambia dataset and predict the whether or not the disease is positive, which is a binary variable given yes(1) or no(0)
+```{r}
+data(gambia)
+Y <- gambia[,3]
+## Y is a binary variable 
+X <- scale(gambia[,4:8])
+s <- gambia[,1:2]
+n <- length(Y)
+S <- unique(s) # Lat/long of the villages
+m <- nrow(S)
+
+village <- rep(0, n)
+for(j in 1:m){
+  d <- (s[,1]-S[j,1])^2 + (s[,2]-S[j,2])^2
+  village[d == 0] <- j
+}
+```
+
+
+#Ridge Logisitic Regression
+
+Next, lets define the ridge logistic regression given the fact that this dataset is a binary dataset...
+
+```{r}
+bayesian_ridge_logistic <- function(y, X, iterations = 10000, burn_in = 1000, tau2 = 1) {
+  n <- length(y)
+  p <- ncol(X)
+  beta <- matrix(0, nrow = iterations, ncol = p)
+  sigma2 <- 1
+  tau2 <- tau2
+  
+  for (i in 2:iterations) {
+    # Sample beta
+    Sigma_beta <- solve(t(X) %*% X + diag(1/tau2, p, p))
+    mu_beta <- Sigma_beta %*% t(X) %*% y
+    beta[i, ] <- mvrnorm(1, mu = mu_beta, Sigma = Sigma_beta)
+    # Sample sigma2
+    sigma2 <- 1 / rgamma(1, shape = n/2, rate = sum((y - X %*% beta[i, ])^2)/2)
+    # Sample tau2
+    tau2 <- 1 / rgamma(1, shape = p/2, rate = sum(beta[i, ]^2)/2)
+  }
+  beta <- beta[-c(1:burn_in), ]
+  return(beta)
+}
+
+# Example usage
+ridge_results <- bayesian_ridge_logistic(Y, X)
+summary(ridge_results)
+```
+
+# Bayesian Lasso Logistic Regression
+
+Lets also define the Bayesian Lasso Logistic regression assuming a beta distrubtion for priors...
+
+```{r}
+bayesian_lasso_logistic <- function(Y, X, n_iter = 1000, lambda = 1.4) {
+  n <- length(Y)  # Assuming Y is a vector
+  p <- ncol(X)    # Number of features
+  
+  # Check dimensions
+  if (n != nrow(X)) {
+    stop("Dimension mismatch: number of rows in X should match the length of Y")
+  }
+  
+  # Initialize matrices and vectors
+  beta <- matrix(0, nrow = n_iter, ncol = p)
+  sigma2 <- 1
+  lambda2 <- rep(lambda, p)
+  
+  for (iter in 2:n_iter) {
+    # Sample beta
+    for (j in 1:p) {
+      X_j <- X[, j]
+      y_star <- Y - X %*% beta[iter - 1, ] + beta[iter - 1, j] * X_j
+      beta_var <- 1 / (t(X_j) %*% X_j / sigma2 + 1 / lambda2[j])
+      beta_mean <- beta_var * (t(X_j) %*% y_star / sigma2)
+      beta[iter, j] <- rnorm(1, mean = beta_mean, sd = sqrt(beta_var))
+    }
+
+    # Sample lambda2
+    for (j in 1:p) {
+      lambda2[j] <- 1 / rgamma(1, shape = 1 + lambda, rate = abs(beta[iter, j]) + lambda)
+    }
+  }
+  
+  return(beta)
+}
+# Example usage
+lasso_results <- bayesian_lasso_logistic(Y, X)
+summary(lasso_results)
+
+```
+
+#Optimalized Lambda and Tau
+
+Next, lets find the most optimal values for Lambda and Tau in order to plug back in given our respective variabbles in order to optimize our results
+
+```{r}
+# Define lambdas
+lambdas <- seq(0.1, 2, by = 0.1)
+
+# Calculate RMSE for each lambda
+rmse_lasso <- sapply(lambdas, function(lambda) {
+  samples <- bayesian_lasso_logistic(Y, X, n_iter = 1000, lambda = lambda)
+  beta <- colMeans(samples)  # Average the samples
+  # Compute predicted values and RMSE
+  predictions <- X %*% beta
+  sqrt(mean((Y - predictions)^2))
+})
+
+# Find the best lambda
+best_lambda_lasso <- lambdas[which.min(rmse_lasso)]
+print(best_lambda_lasso)
+```
+
+### Best Tau value
+
+```{r}
+find_best_tau2 <- function(X, y, tau2_range = seq(0.1, 2, by = 0.1), iterations = 10000, burn_in = 1000) {
+  # Function to calculate a performance metric (e.g., log-likelihood) for a given tau2
+  calculate_log_likelihood <- function(tau2) {
+    samples <- bayesian_ridge_logistic(y, X, iterations = iterations, burn_in = burn_in)
+    # Calculate probabilities using logistic function
+    y_pred <- 1 / (1 + exp(-X %*% colMeans(samples)))
+    log_likelihood <- sum(y * log(y_pred) + (1 - y) * log(1 - y_pred))
+    return(-log_likelihood)  # Minimize negative log-likelihood
+  }
+
+  # Calculate log-likelihood for all tau2 values
+  log_likelihood_values <- sapply(tau2_range, calculate_log_likelihood)
+
+  # Find the tau2 with the maximum log-likelihood (least negative log-likelihood)
+  best_tau2 <- tau2_range[which.min(log_likelihood_values)]
+
+  return(best_tau2)
+}
+
+
+# Find the best tau2
+best_tau2 <- find_best_tau2(X, Y)
+print(best_tau2)
+```
+
+#SSVS Function
+
+This is the function defining the SSVS:
+
+```{r}
+ssvs_binary <- function(data, y, x, inprob = 0.5, runs = 10000, burn = 2000, progress = FALSE) {
+  y <- data[[y]]
+  X <- as.matrix(data[, x])
+  n <- length(y)
+  p <- ncol(X)
+
+  # Priors
+  beta <- rep(0, p)
+  gamma <- rbinom(p, 1, inprob)
+
+  # Storage for samples
+  beta_samples <- matrix(NA, nrow = runs - burn, ncol = p)
+  gamma_samples <- matrix(NA, nrow = runs - burn, ncol = p)
+
+  for (iter in 1:runs) {
+    if (progress && iter %% 1000 == 0) cat("Iteration:", iter, "\n")
+
+    for (j in 1:p) {
+      # Sample gamma_j
+      prob_inclusion <- inprob / (inprob + (1 - inprob) * exp(-0.5 * beta[j]^2))
+      gamma[j] <- rbinom(1, 1, prob_inclusion)
+
+      # Sample beta_j
+      if (gamma[j] == 1) {
+        eta <- X %*% beta
+        p_eta <- 1 / (1 + exp(-eta))
+        W <- diag(as.numeric(p_eta * (1 - p_eta)), n, n)
+        z <- eta + (y - p_eta) / (p_eta * (1 - p_eta))
+        beta_j_var <- solve(t(X) %*% W %*% X)
+        beta_j_mean <- beta_j_var %*% t(X) %*% W %*% z
+        beta[j] <- rnorm(1, beta_j_mean, sqrt(beta_j_var))
+      } else {
+        beta[j] <- 0
+      }
+    }
+
+    if (iter > burn) {
+      beta_samples[iter - burn, ] <- beta
+      gamma_samples[iter - burn, ] <- gamma
+    }
+  }
+
+  return(list(beta_samples = beta_samples, gamma_samples = gamma_samples, beta_mean = colMeans(beta_samples)))
+}
+```
+
+###Plugging in the respective hyperparameter values in our Lasso and Ridge logistic regressions...
+
+```{r}
+# Run the Bayesian Ridge Logistic Regression
+ridge_samples_gambia <- bayesian_ridge_logistic(Y, X, tau2=best_tau2)
+
+# Results
+beta_ridge_gambia <- colMeans(ridge_samples_gambia!= 0)
+ridge_cred_int_gambia <- apply(ridge_samples_gambia, 2, quantile, probs = c(0.025, 0.975))
+
+print(beta_ridge_gambia)
+print(ridge_cred_int_gambia)
+```
+
+```{r}
+# Run the Bayesian Lasso Logistic Regression
+lasso_samples_gambia <- bayesian_lasso_logistic(Y, X, lambda = best_lambda_lasso)
+
+# Results
+beta_lasso_gambia <- colMeans(lasso_samples_gambia!= 0)
+lasso_cred_int_gambia <- apply(lasso_samples_gambia, 2, quantile, probs = c(0.025, 0.975))
+
+print(beta_lasso_gambia)
+print(lasso_cred_int_gambia)
+```
+
+
+###Redefining the SSVS binary function (Beta Dist.)
+```{r}
+ssvs_binary <- function(data, y, x, inprob, runs, burn, progress) {
+  x <- data[,x]
+  y <- data[,y]
+
+  # Scale inputs
+  x <- scale(as.matrix(x))
+  y <- as.matrix(y)
+
+  # Make a column of 1s for the design matrix
+  intercept <- rep(1, nrow(x))
+
+  # Create design matrix that includes the column of 1s, and the predictors
+  designMatrix <- as.matrix(cbind(intercept, x))
+
+  # Save the prior value to use
+  myPrior <- BoomSpikeSlab::LogitZellnerPrior(predictors = designMatrix,
+                                              successes = y,
+                                              trials = NULL,
+                                              expected.model.size = (ncol(x)*inprob),
+                                              prior.inclusion.probabilities = NULL)
+
+  ## logit.spike()
+  if (progress) {
+    ping <- runs / 10
+  } else {
+    ping <- 0
+  }
+  bssResults <- BoomSpikeSlab::logit.spike(formula = as.matrix(y) ~ as.matrix(x),
+                                           niter = runs,
+                                           prior = myPrior,
+                                           ping = ping)
+  bssResults[["beta"]] <- as.data.frame(bssResults[["beta"]][-c(1:burn),-1])
+
+  colnames(bssResults[["beta"]]) <- colnames(x)
+
+  bssResults
+}
+
+# Example usage for Gambia data
+set.seed(123)
+ssvs_results <- ssvs_binary(data = gambia, y = "pos", x = c("age", "netuse", "treated", "green", "phc"), inprob = 0.5, runs = 10000, burn = 1000, progress = TRUE)
+```
+
+###Variable Selection for each SSVS value
+
+```{r}
+ssvs_samples_gambia <- ssvs_results$beta
+ssvs_inclusion_prob_gambia <- colMeans(ssvs_samples_gambia != 0)
+beta_ssvs_gambia <- colMeans(ssvs_samples_gambia)
+print(beta_ssvs_gambia)
+```
+
+### Selected Variables for Ridge, Lasso, and SSVS: Age, Net Use, and Green
+
+```{r}
+# Apply variable selection logic
+selected_variables_ridge <- which(apply(ridge_cred_int_gambia, 2, function(x) sign(x[1]) == sign(x[2])))
+selected_variables_lasso <- which(apply(lasso_cred_int_gambia, 2, function(x) sign(x[1]) == sign(x[2])))
+selected_variables_ssvs <- which(ssvs_inclusion_prob_gambia > 0.5)
+
+print(selected_variables_ridge)
+print(selected_variables_lasso)
+print(selected_variables_ssvs)
+```
+
+#Histograms - (Positive skew for Net Use...)
+
+```{r}
+# Histograms for Bayesian Ridge
+if (length(selected_variables_ridge) > 0) {
+  par(mfrow = c(2, 2))
+  for (i in selected_variables_ridge) {
+    hist(ridge_samples_gambia[, i], main = paste("Histogram of Beta", colnames(X)[i]), xlab = colnames(X)[i], breaks = 100)
+  }
+}
+
+# Histograms for Bayesian Lasso
+if (length(selected_variables_lasso) > 0) {
+  par(mfrow = c(2, 2))
+  for (i in selected_variables_lasso) {
+    hist(lasso_samples_gambia[, i], main = paste("Histogram of Beta", colnames(X)[i]), xlab = colnames(X)[i], breaks = 100)
+  }
+}
+
+# Histograms for Bayesian SSVS
+if (length(selected_variables_ssvs) > 0) {
+  par(mfrow = c(2, 2))
+  for (i in selected_variables_ssvs) {
+    hist(ssvs_samples_gambia[, i], main = paste("Histogram of Beta", colnames(X)[i]), xlab = colnames(X)[i], breaks = 100)
+  }
+}
+```
+
+#Traceplots
+
+### All of the trace plots show good signs with no indication of noise
+
+```{r}
+# Traceplots for Bayesian Ridge
+if (length(selected_variables_ridge) > 0) {
+  par(mfrow = c(2, 2))
+  for (i in selected_variables_ridge) {
+    plot(ridge_samples_gambia[, i], type = "l", main = colnames(X)[i], ylab = "Beta", xlab = "Iteration")
+  }
+}
+
+# Traceplots for Bayesian Lasso
+if (length(selected_variables_lasso) > 0) {
+  par(mfrow = c(2, 2))
+  for (i in selected_variables_lasso) {
+    plot(lasso_samples_gambia[, i], type = "l", main = colnames(X)[i], ylab = "Beta", xlab = "Iteration")
+  }
+}
+
+# Traceplots for Bayesian SSVS
+if (length(selected_variables_ssvs) > 0) {
+  par(mfrow = c(2, 2))
+  for (i in selected_variables_ssvs) {
+    plot(ssvs_samples_gambia[, i], type = "l", main = colnames(X)[i], ylab = "Beta", xlab = "Iteration")
+  }
+}
+```
+
+###Applying selected variables for the ridge and lasso bayesian models...
+
+```{r}
+
+# Define the selected variables (1, 2, 4)
+selected_indices <- c(1, 2, 4)  # Corresponding to columns 4, 5, 7 in the original data
+X_selected <- X[, selected_indices]
+
+# Combine the selected predictors with the response variable into a new data frame
+data_selected <- data.frame(Y = Y, X_selected)
+
+
+bayesian_lasso_logistic_gambia <- bayesian_lasso_logistic(Y, X_selected, lambda = best_lambda_lasso)
+
+# Results
+beta_lasso_gambia <- colMeans(bayesian_lasso_logistic_gambia!= 0)
+lasso_cred_int_gambia <- apply(bayesian_lasso_logistic_gambia, 2, quantile, probs = c(0.025, 0.975))
+
+print(beta_lasso_gambia)
+print(lasso_cred_int_gambia)
+
+bayesian_ridge_logistic_gambia <- bayesian_ridge_logistic(Y, X_selected, tau = best_tau2)
+
+# Results
+beta_ridge_gambia <- colMeans(bayesian_ridge_logistic_gambia!= 0)
+ridge_cred_int_gambia <- apply(bayesian_lasso_logistic_gambia, 2, quantile, probs = c(0.025, 0.975))
+
+print(beta_ridge_gambia)
+print(ridge_cred_int_gambia)
+
+```
+
+
+
+#5-Fold Cross-Validation
+
+### All of the AUC values are close, but the best preforming sees Bayesian Lasso Regression...
+
+```{r warning=FALSE}
+set.seed(123)
+
+# Prepare data for 5-fold cross-validation
+folds <- createFolds(Y, k = 5, list = TRUE)
+
+# Function to calculate AUC for model predictions
+calculate_auc <- function(actual, predicted) {
+  roc_curve <- roc(actual, predicted)
+  auc <- auc(roc_curve)
+  return(auc)
+}
+
+# Initialize vectors to store AUC values
+auc_ssvs <- c()
+auc_ridge <- c()
+auc_lasso <- c()
+
+# Cross-validation loop
+for (fold in folds) {
+  train_indices <- setdiff(seq_len(nrow(data_selected)), fold)
+  test_indices <- fold
+
+  X_train <- X_selected[train_indices, ]
+  Y_train <- Y[train_indices]
+  X_test <- X_selected[test_indices, ]
+  Y_test <- Y[test_indices]
+
+  # Fit SSVS model
+  ssvs_model <- ssvs_binary(data = data.frame(Y = Y_train, X_train), y = "Y", x = selected_indices, inprob = 0.5, runs = 10000, burn = 1000, progress = FALSE)
+  ssvs_beta <- colMeans(ssvs_model$beta)
+  ssvs_pred <- plogis(X_test %*% ssvs_beta)
+  auc_ssvs <- c(auc_ssvs, calculate_auc(Y_test, ssvs_pred))
+
+  # Fit Bayesian Ridge model
+  ridge_model <- bayesian_ridge_logistic(Y_train, X_train, tau = best_tau2)
+  ridge_beta <- colMeans(ridge_model)
+  ridge_pred <- plogis(X_test %*% ridge_beta)
+  auc_ridge <- c(auc_ridge, calculate_auc(Y_test, ridge_pred))
+
+  # Fit Bayesian Lasso model
+  lasso_model <- bayesian_lasso_logistic(Y_train, X_train, lambda = best_lambda_lasso)
+  lasso_beta <- colMeans(lasso_model)
+  lasso_pred <- plogis(X_test %*% lasso_beta)
+  auc_lasso <- c(auc_lasso, calculate_auc(Y_test, lasso_pred))
+}
+
+# Print AUC results
+print("5 Fold Cross-Validation:")
+print(paste("SSVS AUC:", mean(auc_ssvs)))
+print(paste("Ridge AUC:", mean(auc_ridge)))
+print(paste("Lasso AUC:", mean(auc_lasso)))
+```
+
+# Inclusion Probablility 
+### This determines the likelihood of the variables being included in the ssvs function...
+
+```{r}
+
+Inc_Prob <- apply(ssvs_results$beta != 0, 2, mean)
+Q <- t(apply(ssvs_results$beta, 2, quantile, c(0.5, 0.05, 0.95)))
+out <- cbind(Inc_Prob, Q)
+colnames(out) <- c("Inc_Prob", "50%", "5%", "95%")
+knitr::kable(round(out, 2))
+```
+
+
+
+
+
+###AUC values in terms of 5-Fold Cross-val for each respective model....
+
+```{r}
+# Define the plot_roc_curve function
+plot_roc_curve <- function(actual, predicted, auc_value, model_name) {
+  # Ensure 'predicted' is a numeric vector
+  predicted_numeric <- as.numeric(predicted)
+
+  # Compute ROC curve
+  roc_curve <- roc(actual, predicted_numeric)
+
+  # Create ROC plot
+  ggplot(data = data.frame(
+    FPR = rev(roc_curve$specificities),
+    TPR = rev(roc_curve$sensitivities)
+  ), aes(x = FPR, y = TPR)) +
+    geom_line(color = "blue") +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+    labs(
+      title = paste(model_name, "ROC Curve - AUC:", round(auc_value, 2)),
+      x = "False Positive Rate (1 - Specificity)",
+      y = "True Positive Rate (Sensitivity)"
+    ) +
+    theme_minimal()
+}
+
+# Initialize storage for ROC curve data
+roc_data_ssvs <- data.frame(FPR = numeric(), TPR = numeric())
+roc_data_ridge <- data.frame(FPR = numeric(), TPR = numeric())
+roc_data_lasso <- data.frame(FPR = numeric(), TPR = numeric())
+
+# Cross-validation loop
+for (fold in folds) {
+  train_indices <- setdiff(seq_len(nrow(data_selected)), fold)
+  test_indices <- fold
+
+  X_train <- X_selected[train_indices, ]
+  Y_train <- Y[train_indices]
+  X_test <- X_selected[test_indices, ]
+  Y_test <- Y[test_indices]
+
+  # Fit SSVS model
+  ssvs_model <- ssvs_binary(data = data.frame(Y = Y_train, X_train), y = "Y", x = selected_indices, inprob = 0.5, runs = 10000, burn = 1000, progress = FALSE)
+  ssvs_beta <- colMeans(ssvs_model$beta)
+  ssvs_pred <- plogis(X_test %*% ssvs_beta)
+  roc_curve_ssvs <- roc(Y_test, ssvs_pred)
+  roc_data_ssvs <- rbind(roc_data_ssvs, data.frame(FPR = rev(roc_curve_ssvs$specificities), TPR = rev(roc_curve_ssvs$sensitivities)))
+
+  # Fit Bayesian Ridge model
+  ridge_model <- bayesian_ridge_logistic(Y_train, X_train, tau = best_tau2)
+  ridge_beta <- colMeans(ridge_model)
+  ridge_pred <- plogis(X_test %*% ridge_beta)
+  roc_curve_ridge <- roc(Y_test, ridge_pred)
+  roc_data_ridge <- rbind(roc_data_ridge, data.frame(FPR = rev(roc_curve_ridge$specificities), TPR = rev(roc_curve_ridge$sensitivities)))
+
+  # Fit Bayesian Lasso model
+  lasso_model <- bayesian_lasso_logistic(Y_train, X_train, lambda = best_lambda_lasso)
+  lasso_beta <- colMeans(lasso_model)
+  lasso_pred <- plogis(X_test %*% lasso_beta)
+  roc_curve_lasso <- roc(Y_test, lasso_pred)
+  roc_data_lasso <- rbind(roc_data_lasso, data.frame(FPR = rev(roc_curve_lasso$specificities), TPR = rev(roc_curve_lasso$sensitivities)))
+}
+
+# Calculate AUC values
+auc_ssvs <- mean(sapply(folds, function(fold) {
+  X_train <- X_selected[-fold, ]
+  Y_train <- Y[-fold]
+  X_test <- X_selected[fold, ]
+  Y_test <- Y[fold]
+  ssvs_model <- ssvs_binary(data = data.frame(Y = Y_train, X_train), y = "Y", x = selected_indices, inprob = 0.5, runs = 10000, burn = 1000, progress = FALSE)
+  ssvs_beta <- colMeans(ssvs_model$beta)
+  ssvs_pred <- plogis(X_test %*% ssvs_beta)
+  calculate_auc(Y_test, ssvs_pred)
+}))
+
+auc_ridge <- mean(sapply(folds, function(fold) {
+  X_train <- X_selected[-fold, ]
+  Y_train <- Y[-fold]
+  X_test <- X_selected[fold, ]
+  Y_test <- Y[fold]
+  ridge_model <- bayesian_ridge_logistic(Y_train, X_train, tau = best_tau2)
+  ridge_beta <- colMeans(ridge_model)
+  ridge_pred <- plogis(X_test %*% ridge_beta)
+  calculate_auc(Y_test, ridge_pred)
+}))
+
+auc_lasso <- mean(sapply(folds, function(fold) {
+  X_train <- X_selected[-fold, ]
+  Y_train <- Y[-fold]
+  X_test <- X_selected[fold, ]
+  Y_test <- Y[fold]
+  lasso_model <- bayesian_lasso_logistic(Y_train, X_train, lambda = best_lambda_lasso)
+  lasso_beta <- colMeans(lasso_model)
+  lasso_pred <- plogis(X_test %*% lasso_beta)
+  calculate_auc(Y_test, lasso_pred)
+}))
+
+# Print AUC results
+print("5 Fold Cross-Validation:")
+print(paste("SSVS AUC:", auc_ssvs))
+print(paste("Ridge AUC:", auc_ridge))
+print(paste("Lasso AUC:", auc_lasso))
+
+# Plot ROC curves
+ggplot() +
+  geom_line(data = roc_data_ssvs, aes(x = FPR, y = TPR), color = "blue") +
+  geom_line(data = roc_data_ridge, aes(x = FPR, y = TPR), color = "green") +
+  geom_line(data = roc_data_lasso, aes(x = FPR, y = TPR), color = "red") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey") +
+  labs(
+    title = "ROC Curves for Different Models",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)"
+  ) +
+  theme_minimal() +
+  scale_color_manual(name = "Model", values = c("SSVS" = "blue", "Ridge" = "green", "Lasso" = "red"))
+```
+
+###Defining functions for DIC and WAIC
+
+```{r}
+# Function to compute log likelihood
+log_lik <- function(beta, X, y) {
+  p <- plogis(X %*% beta)
+  return(dbinom(y, size = 1, prob = p, log = TRUE))
+}
+
+# Function to compute DIC and WAIC
+compute_dic_waic <- function(samples, X, y) {
+  log_lik_values <- apply(samples, 1, function(beta) log_lik(beta, X, y))
+
+  # Compute DIC
+  pD <- mean(apply(log_lik_values, 2, var)) / 2
+  DIC <- -2 * mean(apply(log_lik_values, 1, sum)) + 2 * pD
+
+  # Compute WAIC
+  waic_res <- waic(log_lik_values)
+
+  list(DIC = DIC, WAIC = waic_res$waic)
+}
+```
+
+###Calculate the DIC and WAIC values for ridge, lasso, and SSVS
+
+```{r}
+  
+dic_waic_ridge <- compute_dic_waic(ridge_results, X, Y)
+dic_waic_lasso <- compute_dic_waic(lasso_results, X, Y)
+dic_waic_ssvs <- compute_dic_waic(ssvs_results$beta, X, Y)
+```
+
+### Lasso is the preferred method according to the DIC and WAIC numbers.....
+
+
+```{r}
+cat("DIC and WAIC calculations:", "\n")
+cat("DIC and WAIC for Lasso Model:\n")
+print(dic_waic_lasso)
+cat("DIC and WAIC for Ridge Model:\n")
+print(dic_waic_ridge)
+cat("DIC and WAIC for SSVS Model:\n")
+print(dic_waic_ssvs)
+```
+
+###Bayes Factor model to compare each model with each other....
+
+```{r}
+compute_bayes_factor <- function(samples1, samples2) {
+  posterior1 <- density(samples1)
+  posterior2 <- density(samples2)
+
+  posterior_density1 <- approxfun(posterior1)(0)
+  posterior_density2 <- approxfun(posterior2)(0)
+
+  prior1 <- dnorm(0, mean = mean(samples1), sd = sd(samples1))
+  prior2 <- dnorm(0, mean = mean(samples2), sd = sd(samples2))
+
+  if (is.na(posterior_density1) || is.na(posterior_density2)) {
+    return(Inf)
+  }
+
+  posterior_density_ratio <- posterior_density1 / posterior_density2
+  prior_density_ratio <- prior1 / prior2
+
+  bf <- posterior_density_ratio / prior_density_ratio
+  bf
+}
+
+# Recompute Bayes Factor for each pair of models
+bayes_factor_ridge_lasso <- compute_bayes_factor(ridge_results[,1], lasso_results[,1])
+bayes_factor_ridge_ssvs <- compute_bayes_factor(ridge_results[,1], ssvs_results$beta[,1])
+bayes_factor_lasso_ssvs <- compute_bayes_factor(lasso_results[,1], ssvs_results$beta[,1])
+
+# Compute Bayes Factor for each pair of models
+bayes_factor_ridge_lasso <- compute_bayes_factor(ridge_results[,1], lasso_results[,1])
+bayes_factor_ridge_ssvs <- compute_bayes_factor(ridge_results[,1], ssvs_results$beta[,1])
+bayes_factor_lasso_ssvs <- compute_bayes_factor(lasso_results[,1], ssvs_results$beta[,1])
+```
+
+
+###Redefine the bayes factor using infinity....
+
+
+```{r}
+compute_bayes_factor <- function(samples1, samples2) {
+  posterior1 <- density(samples1)
+  posterior2 <- density(samples2)
+
+  posterior_density1 <- approxfun(posterior1)(0)
+  posterior_density2 <- approxfun(posterior2)(0)
+
+  prior1 <- dnorm(0, mean = mean(samples1), sd = sd(samples1))
+  prior2 <- dnorm(0, mean = mean(samples2), sd = sd(samples2))
+
+  if (is.na(posterior_density1) || is.na(posterior_density2)) {
+    return(Inf)
+  }
+
+  posterior_density_ratio <- posterior_density1 / posterior_density2
+  prior_density_ratio <- prior1 / prior2
+
+  bf <- posterior_density_ratio / prior_density_ratio
+  bf
+}
+
+# Recompute Bayes Factor for each pair of models
+bayes_factor_ridge_lasso <- compute_bayes_factor(ridge_results[,1], lasso_results[,1])
+bayes_factor_ridge_ssvs <- compute_bayes_factor(ridge_results[,1], ssvs_results$beta[,1])
+bayes_factor_lasso_ssvs <- compute_bayes_factor(lasso_results[,1], ssvs_results$beta[,1])
+
+# Compute Bayes Factor for each pair of models
+bayes_factor_ridge_lasso <- compute_bayes_factor(ridge_results[,1], lasso_results[,1])
+bayes_factor_ridge_ssvs <- compute_bayes_factor(ridge_results[,1], ssvs_results$beta[,1])
+bayes_factor_lasso_ssvs <- compute_bayes_factor(lasso_results[,1], ssvs_results$beta[,1])
+```
+
+###SSVS is the greatly preferred method according to the Bayes Factor...
+
+```{r}
+cat("Bayes Factor (Ridge vs Lasso):", bayes_factor_ridge_lasso, "\n")
+cat("Bayes Factor (Ridge vs SSVS):", bayes_factor_ridge_ssvs, "\n")
+cat("Bayes Factor (Lasso vs SSVS):", bayes_factor_lasso_ssvs, "\n")
+```
+
+
+#Questions and values: 
+
+### (a) Comparison of Results
+
+#### 1. Comparison of Models
+
+**Bayesian Ridge Regression**:
+- **Parameter Estimates**: Uses a Gaussian prior, leading to smaller and more evenly distributed coefficients. 
+
+
+**Bayesian Lasso**:
+- **Parameter Estimates**: Utilizes a Beta prior, which can result in some coefficients being exactly zero. Helps in feature selection and clarity.
+
+**SSVS (Stochastic Search Variable Selection)**:
+- **Parameter Estimates**: Incorporates a mixture of normal distributions, allowing more flexibility in selecting variables. It provides a probabilistic measure of inclusion for each covariate.
+
+- **Inclusion Probabilities**: Determines the relevance of the covariates. Higher probabilities greater than 0.5 suggested stronger evidence for including a variable, filtered out which gave way to age,, netuse, and green as important variables.
+
+#### 2. Model Performance
+
+**DIC (Deviance Information Criterion)**:
+- **Bayesian Ridge Logistic **: DIC = 12274.83
+- **Bayesian Lasso Logistic**: DIC = 1360.30
+- **SSVS**: DIC = 11967.79
+
+**WAIC (Widely Applicable Information Criterion)**:
+- **Bayesian Ridge Logistic**: WAIC = 12301.64
+- **Bayesian Lasso Logistic**: WAIC = 1364.62
+- **SSVS**: WAIC = 12606.29
+
+**Bayes Factor**:
+- **Ridge vs Lasso**: 0.4769 (suggests Ridge is less preferred compared to Lasso)
+- **Ridge vs SSVS**: Inf (indicates Ridge is significantly worse than SSVS)
+- **Lasso vs SSVS**: Inf (indicates Lasso is significantly worse than SSVS)
+
+**AUC (Area Under Curve)**:
+- **Bayesian Ridge Regression**: AUC = 0.6381
+- **Bayesian Lasso**: AUC = 0.6383
+- **SSVS**: AUC = 0.5813
+
+**Interpretation**:
+- **Bayesian Lasso** achieved the best performance in terms of DIC, WAIC, and AUC, indicating it is the most effective model overall.
+
+- **SSVS** showed the best Bayes Factor, suggesting strong evidence for model improvement over Ridge and Lasso models.
+
+### (b) Challenges in Tuning Parameters
+
+#### 1. Challenges Faced
+
+- **Bayesian Ridge Regression**: The main challenge was finding the optimal regularization parameter (τ) to balance bias and variance, which required extensive cross-validation and careful consideration of overfitting.
+
+- **Bayesian Lasso**: Tuning the lambda (λ) parameter was challenging as it directly impacts feature selection which required multiple iterations and sensitivity analysis.
+
+- **SSVS**: Managing the computational complexity of SSVS was a significant challenge. The model's flexibility with inclusion probabilities over 0.5 helped evaluate and interpret results. 
+
+### (c) Significance of Covariates
+
+#### 1. SSVS and Inclusion Probabilities > 0.5
+
+**Pros**:
+- **Pros**: SSVS provides a probabilistic measure of variable importance, allowing for a more nuanced understanding of which covariates are influential. 
+
+**Cons**:
+- **Cons**: The inclusion probabilities can sometimes be misleading if the model converges poorly. 
+
+#### 2. Bayesian Ridge Regression and Bayesian Lasso
+
+**Bayesian Ridge Regression**:
+
+- **Pros**: Provides a stable estimate with regularization that balances bias and variance while not forcing coefficents to zero. 
+
+- **Cons**: Less effective in feature selection as it does not set coefficients exactly to zero, which makes it harder to identify relevant variables.
+
+**Bayesian Lasso**:
+- **Pros**: Great for feature selection as it can push some coefficients exactly to zero, making the model more interpretable and reduces overfitting.
+
+
+- **Cons**: Model may not perform as well if too many variables are forced to zero, potentially leading to underfitting.
+
+**Summary**:
+The Bayesian Lasso Logistic Regression model, with λ = 1.7, emerged as the best-performing model based on AUC, DIC, and WAIC. This model, with the selected variables "Age", "Netuse", and "Green", offers a balance between simplicity and performance.
+
